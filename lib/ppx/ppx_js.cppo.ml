@@ -37,12 +37,19 @@ let inside_Js = lazy
      Filename.basename (Filename.chop_extension !Location.input_name) = "js"
    with Invalid_argument _ -> false)
 
+
+let to_js_of_ocaml = lazy None
+
 module Js = struct
 
   let type_ ?loc s args =
-    if Lazy.force inside_Js
-    then Typ.constr ?loc (lid s) args
-    else Typ.constr ?loc (lid ("Js."^s)) args
+    match to_js_of_ocaml with
+    | lazy None ->
+      if Lazy.force inside_Js
+      then Typ.constr ?loc (lid s) args
+      else Typ.constr ?loc (lid ("Js."^s)) args
+    | lazy (Some prefix) ->
+      Typ.constr ?loc (lid (prefix ^ ".Js." ^ s)) args
 
 #if OCAML_VERSION < (4, 03, 0)
   let nolabel = ""
@@ -52,16 +59,22 @@ module Js = struct
 
   let unsafe ?loc s args =
     let args = List.map (fun x -> nolabel,x) args in
+    match to_js_of_ocaml with
+    | lazy None ->
     if Lazy.force inside_Js
     then Exp.(apply ?loc (ident ?loc (lid ?loc ("Unsafe."^s))) args)
     else Exp.(apply ?loc (ident ?loc (lid ?loc ("Js.Unsafe."^s))) args)
-
+    | lazy (Some prefix) ->
+      Exp.(apply ?loc (ident ?loc (lid ?loc (prefix ^ ".Js.Unsafe." ^ s))) args)
   let fun_ ?loc s args =
     let args = List.map (fun x -> nolabel,x) args in
+    match to_js_of_ocaml with
+    | lazy None ->
     if Lazy.force inside_Js
     then Exp.(apply ?loc (ident ?loc (lid ?loc s)) args)
     else Exp.(apply ?loc (ident ?loc (lid ?loc ("Js."^s))) args)
-
+    | lazy (Some prefix) ->
+      Exp.(apply ?loc (ident ?loc (lid ?loc (prefix ^ ".Js." ^ s))) args)
 end
 
 let unescape lab =
@@ -84,9 +97,9 @@ let inject_arg e = Js.unsafe "inject" [e]
 let inject_args args =
   Exp.array (List.map (fun e -> Js.unsafe "inject" [e]) args)
 
-let obj_arrows targs tres =
+let obj_arrows targs tres wrap =
   let lbl, tobj, tobjres = List.hd targs and targs = List.tl targs in
-  arrows ((lbl, Js.type_ "t" [arrows tobj tobjres]) :: (targs_arrows targs)) tres
+  arrows ((lbl, Js.type_ "t" [arrows tobj tobjres]) :: (targs_arrows targs) @ [Js.nolabel, wrap]) tres
 
 let invoker uplift downlift body desc =
   let labels = List.map fst desc in
@@ -110,16 +123,16 @@ let invoker uplift downlift body desc =
   let tres = typ res in
 
   let twrap = uplift targs tres in
-  let tfunc = downlift targs tres in
+  let tfunc = downlift targs tres twrap in
 
   let ebody = body (List.map (fun s -> Exp.ident (lid s)) args) in
 
   let efun label arg expr =
     Exp.fun_ label None (Pat.var (Location.mknoloc arg)) expr
   in
-  let efun = List.fold_right2 efun labels args ebody in
+  let efun = List.fold_right2 efun labels args [%expr (fun _ -> [%e ebody])] in
 
-  let invoker = [%expr ((fun _ -> [%e efun]) : [%t twrap] -> [%t tfunc]) ] in
+  let invoker = [%expr ([%e efun] : [%t tfunc]) ] in
 
   let result = List.fold_right Exp.newtype (res :: ntargs) invoker in
 
@@ -140,11 +153,11 @@ let method_call ~loc obj meth args =
       ((Js.nolabel,[]) :: List.map (fun (l,_) -> l,[]) args)
   in
   Exp.apply invoker (
-    app_arg
-      (Exp.fun_ ~loc Js.nolabel None
-         (Pat.var ~loc:Location.none (Location.mknoloc "x"))
-         (Exp.send ~loc (Exp.ident ~loc:gloc (lid ~loc:gloc "x")) meth)) ::
     app_arg obj :: args
+    @ [app_arg
+        (Exp.fun_ ~loc Js.nolabel None
+           (Pat.var ~loc:Location.none (Location.mknoloc "x"))
+           (Exp.send ~loc (Exp.ident ~loc:gloc (lid ~loc:gloc "x")) meth))]
   )
 
 let prop_get ~loc obj prop =
@@ -158,11 +171,12 @@ let prop_get ~loc obj prop =
       [Js.nolabel,[]]
   in
   Exp.apply invoker (
-    app_arg
-      (Exp.fun_ ~loc Js.nolabel None
-         (Pat.var ~loc:Location.none (Location.mknoloc "x"))
-         (Exp.send ~loc (Exp.ident ~loc:gloc (lid ~loc:gloc "x")) prop)) ::
-    [app_arg obj]
+    [ app_arg obj
+    ; app_arg
+        (Exp.fun_ ~loc Js.nolabel None
+           (Pat.var ~loc:Location.none (Location.mknoloc "x"))
+           (Exp.send ~loc (Exp.ident ~loc:gloc (lid ~loc:gloc "x")) prop))
+    ]
   )
 
 let prop_set ~loc obj prop value =
@@ -174,7 +188,7 @@ let prop_set ~loc obj prop value =
            arrows [Js.nolabel,tobj]
              (Js.type_ "gen_prop" [[%type: <set: [%t targ] -> unit; ..> ]])
          | _ -> assert false)
-      (fun targs _tres -> obj_arrows targs [%type: unit])
+      (fun targs _tres wrap -> obj_arrows targs [%type: unit] wrap)
       (function
         | [obj; arg] ->
           Js.unsafe "set" [obj; str (unescape prop); inject_arg arg]
@@ -182,22 +196,24 @@ let prop_set ~loc obj prop value =
       [Js.nolabel, []; Js.nolabel, []]
   in
   Exp.apply invoker (
-    app_arg
-      (Exp.fun_ ~loc Js.nolabel None
-         (Pat.var ~loc:Location.none (Location.mknoloc "x"))
-         (Exp.send ~loc (Exp.ident ~loc:gloc (lid ~loc:gloc "x")) prop)) ::
-    [app_arg obj; app_arg value]
+    [ app_arg obj
+    ; app_arg value
+    ; app_arg
+        (Exp.fun_ ~loc Js.nolabel None
+           (Pat.var ~loc:Location.none (Location.mknoloc "x"))
+           (Exp.send ~loc (Exp.ident ~loc:gloc (lid ~loc:gloc "x")) prop))
+    ]
   )
 
 (** Instantiation of a class, used by new%js. *)
 let new_object constr args =
   let invoker = invoker
       (fun _targs _tres -> [%type: unit])
-      (fun targs tres ->
+      (fun targs tres wrap ->
          let _unit = List.hd targs and targs = List.tl targs in
          let tres = Js.type_ "t" [tres] in
          let arrow = arrows (targs_arrows targs) tres in
-         arrows [(Js.nolabel, Js.type_ "constr" [arrow])] arrow)
+         arrows [(Js.nolabel, Js.type_ "constr" [arrow]); (Js.nolabel,wrap)] arrow)
       (function
         | (constr :: args) ->
           Js.unsafe "new_obj" [constr; inject_args args]
@@ -205,7 +221,7 @@ let new_object constr args =
       ((Js.nolabel,[]) :: List.map (fun (l,_) -> l, []) args)
   in
   Exp.apply invoker (
-    app_arg [%expr ()] :: app_arg (Exp.ident ~loc:constr.loc constr) :: args
+    app_arg (Exp.ident ~loc:constr.loc constr) :: args @ [app_arg [%expr ()]]
   )
 
 
@@ -298,7 +314,7 @@ let literal_object ~loc self_id ( fields : field_desc list) =
            ) fields targs
          in
          arrows ((Js.nolabel, Js.type_ "t" [tres]) :: targs) tres)
-      (fun targs tres ->
+      (fun targs tres wrap ->
          let targs =
            List.map2 (fun f (l,args,ret) ->
              match f with
@@ -306,7 +322,7 @@ let literal_object ~loc self_id ( fields : field_desc list) =
              | `Meth _ -> l, (Js.nolabel, Js.type_ "t" [tres])::List.tl args, ret
            ) fields targs
          in
-         arrows (targs_arrows targs) (Js.type_ "t" [tres])
+         arrows (targs_arrows targs @ [ Js.nolabel, wrap ]) (Js.type_ "t" [tres])
       )
       (fun args ->
          Js.unsafe
@@ -330,12 +346,11 @@ let literal_object ~loc self_id ( fields : field_desc list) =
 
   let fake_object =
     Exp.object_ ~loc:loc
-      { pcstr_self = (Pat.any ~loc:Location.none ());
+      { pcstr_self = Pat.any ~loc:Location.none ();
         pcstr_fields =
           (List.map
              (fun f ->
                 let loc = (name f).loc in
-                let gloc = { loc with Location.loc_ghost = true} in
                 let apply e = match f with
                   | `Val _ -> e
                   | `Meth _ -> Exp.apply e [Js.nolabel, Exp.ident (lid ~loc:Location.none self) ]
@@ -346,21 +361,22 @@ let literal_object ~loc self_id ( fields : field_desc list) =
                     Pcf_method
                       (name f,
                        Public,
-                       Cfk_concrete (Fresh, apply (Exp.ident ~loc:gloc (lid ~loc:Location.none (name f).txt)))
+                       Cfk_concrete (Fresh, apply (Exp.ident ~loc (lid ~loc:Location.none (name f).txt)))
                       )
                 })
              fields)
       }
   in
   Exp.apply invoker (
-
-    app_arg (List.fold_right (fun name fun_ ->
-      (Exp.fun_ ~loc Js.nolabel None
-         (Pat.var ~loc:Location.none (Location.mknoloc name))
-         fun_))
-      (self :: List.map (fun f -> (name f).txt) fields)
-      fake_object
-    ) :: (List.map (fun f -> app_arg (body f)) fields))
+    (List.map (fun f -> app_arg (body f)) fields)
+    @ [
+      app_arg (List.fold_right (fun name fun_ ->
+        (Exp.fun_ ~loc Js.nolabel None
+           (Pat.var ~loc:Location.none (Location.mknoloc name))
+           fun_))
+        (self :: List.map (fun f -> (name f).txt) fields)
+        fake_object
+      )] )
 
 let js_mapper _args =
   { default_mapper with
