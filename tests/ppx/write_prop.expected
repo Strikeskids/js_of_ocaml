@@ -8,17 +8,17 @@ Characters 25-28:
                           ^^^
 Error: This expression has type <  >
        It has no method p
-Characters 58-59:
+Characters 52-59:
   fun (obj : < p : float Js.readonly_prop > Js.t) -> obj##.p := 1
-                                                           ^
+                                                     ^^^^^^^
 Error: This expression has type
          float Js.readonly_prop = < get : float > Js.gen_prop
        but an expression was expected of type
          < set : int -> unit; .. > Js.gen_prop
        The first object type has no method set
-Characters 49-50:
+Characters 43-50:
   fun (obj : < p : float Js.prop > Js.t) -> obj##.p := 1
-                                                  ^
+                                            ^^^^^^^
 Error: This expression has type
          float Js.prop = < get : float; set : float -> unit > Js.gen_prop
        but an expression was expected of type

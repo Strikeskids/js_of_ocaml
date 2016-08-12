@@ -4,7 +4,6 @@ open Ast_mapper
 open Ast_helper
 open Asttypes
 open Parsetree
-(* open Ppx_tools.Std *)
 open Ast_convenience
 
 (** Check if an expression is an identifier and returns it.
@@ -38,6 +37,7 @@ let inside_Js = lazy
      Filename.basename (Filename.chop_extension !Location.input_name) = "js"
    with Invalid_argument _ -> false)
 
+let merlin_noloc = { txt = "merlin.loc"; loc = Location.none }, PStr []
 
 (* let to_js_of_ocaml = lazy (Some "Js_of_ocaml") *)
 let to_js_of_ocaml = lazy None
@@ -169,13 +169,13 @@ let method_call ~loc obj meth args =
   Exp.apply invoker (
     app_arg obj :: args
     @ [app_arg
-         (Exp.fun_ ~loc:Location.none Js.nolabel None
-            (Pat.var ~loc:Location.none (Location.mknoloc "x"))
-            (Exp.send ~loc:{!default_loc with Location.loc_ghost = true}
-               (Exp.ident ~loc:loc (lid ~loc:gloc "x")) meth))]
+         (Exp.fun_ ~loc ~attrs:[merlin_noloc] Js.nolabel None
+            (Pat.var ~loc ~attrs:[merlin_noloc] (Location.mknoloc "x"))
+            (Exp.send ~loc ~attrs:[merlin_noloc]
+               (Exp.ident ~loc:gloc (lid ~loc:gloc "x")) meth))]
   )
 
-let prop_get ~loc obj prop =
+let prop_get ~loc:_ ~prop_loc obj prop =
   let gloc = {obj.pexp_loc with Location.loc_ghost = true} in
   let obj = Exp.constraint_ ~loc:gloc obj (open_t gloc) in
   let invoker =
@@ -189,14 +189,14 @@ let prop_get ~loc obj prop =
   Exp.apply invoker (
     [ app_arg obj
     ; app_arg
-        (Exp.fun_ ~loc:loc Js.nolabel None
-           (Pat.var ~loc:Location.none (Location.mknoloc "x"))
-           (Exp.send ~loc:{!default_loc with Location.loc_ghost = true}
-              (Exp.ident ~loc:gloc (lid ~loc:Location.none "x")) prop))
+        (Exp.fun_ ~loc:gloc Js.nolabel None
+           (Pat.var ~loc:gloc ~attrs:[merlin_noloc] (Location.mknoloc "x"))
+           (Exp.send ~loc:prop_loc ~attrs:[merlin_noloc]
+              (Exp.ident ~loc:gloc (lid ~loc:gloc "x")) prop))
     ]
   )
 
-let prop_set ~loc obj prop value =
+let prop_set ~loc ~prop_loc obj prop value =
   let gloc = {obj.pexp_loc with Location.loc_ghost = true} in
   let obj = Exp.constraint_ ~loc:gloc obj (open_t gloc) in
   let invoker =
@@ -218,8 +218,9 @@ let prop_set ~loc obj prop value =
     ; app_arg value
     ; app_arg
         (Exp.fun_ ~loc Js.nolabel None
-           (Pat.var ~loc:Location.none (Location.mknoloc "x"))
-           (Exp.send ~loc (Exp.ident ~loc:gloc (lid ~loc:gloc "x")) prop))
+           (Pat.var ~loc:gloc ~attrs:[merlin_noloc] (Location.mknoloc "x"))
+           (Exp.send ~loc:prop_loc ~attrs:[merlin_noloc]
+              (Exp.ident ~loc:gloc (lid ~loc:gloc "x")) prop))
     ]
   )
 
@@ -241,7 +242,7 @@ let new_object constr args =
   in
   Exp.apply invoker (
     app_arg (Exp.ident ~loc:constr.loc constr) :: args
-    @ [app_arg (Exp.construct ~loc:Location.none (lid ~loc:Location.none "()") None)]
+    @ [app_arg (Exp.construct ~loc:constr.loc (lid ~loc:constr.loc "()") None)]
   )
 
 module S = Map.Make(String)
@@ -412,20 +413,19 @@ let js_mapper _args =
         | [%expr [%e? obj] ##. [%e? meth] ] ->
           let obj = mapper.expr mapper obj in
           let prop = exp_to_string meth in
-          let new_expr = prop_get ~loc:meth.pexp_loc obj prop in
+          let new_expr = prop_get ~loc:meth.pexp_loc ~prop_loc:expr.pexp_loc  obj prop in
           mapper.expr mapper  { new_expr with pexp_attributes }
 
         (* obj##.var := value *)
-        | [%expr [%e? [%expr [%e? obj] ##. [%e? meth]]] := [%e? value]] ->
+        | [%expr [%e? [%expr [%e? obj] ##. [%e? meth]] as prop] := [%e? value]] ->
           let obj = mapper.expr mapper obj in
           let value = mapper.expr mapper value in
+          let prop_loc = prop.pexp_loc in
           let prop = exp_to_string meth in
-          let new_expr = prop_set ~loc:meth.pexp_loc obj prop value in
+          let new_expr = prop_set ~loc:meth.pexp_loc ~prop_loc obj prop value in
           mapper.expr mapper  { new_expr with pexp_attributes }
 
-        (* obj##meth arg1 arg2 .. *)
         (* obj##(meth arg1 arg2) .. *)
-        | {pexp_desc = Pexp_apply (([%expr [%e? obj] ## [%e? meth]]), args); _}
         | [%expr [%e? obj] ## [%e? {pexp_desc = Pexp_apply(meth,args); _}]]
           ->
           let meth_str = exp_to_string meth in
@@ -433,6 +433,16 @@ let js_mapper _args =
           let args = List.map (fun (s,e) -> s, mapper.expr mapper e) args in
           let new_expr = method_call ~loc:meth.pexp_loc obj meth_str args in
           mapper.expr mapper  { new_expr with pexp_attributes }
+
+        (* obj##meth arg1 arg2 .. *)
+        | {pexp_desc = Pexp_apply (([%expr [%e? obj] ## [%e? meth]]) as prop, args); _}
+          ->
+          let meth_str = exp_to_string meth in
+          let obj = mapper.expr mapper  obj in
+          let args = List.map (fun (s,e) -> s, mapper.expr mapper e) args in
+          let new_expr = method_call ~loc:prop.pexp_loc obj meth_str args in
+          mapper.expr mapper  { new_expr with pexp_attributes }
+
         (* obj##meth *)
         | ([%expr [%e? obj] ## [%e? meth]] as expr) ->
           let obj = mapper.expr mapper  obj in
@@ -444,6 +454,7 @@ let js_mapper _args =
         | [%expr [%js [%e? {pexp_desc = Pexp_new constr; _}]]] ->
           let new_expr = new_object constr [] in
           mapper.expr mapper { new_expr with pexp_attributes }
+
         (* new%js constr arg1 arg2 ..)] *)
         | {pexp_desc = Pexp_apply
                          ([%expr [%js [%e? {pexp_desc = Pexp_new constr; _}]]]
